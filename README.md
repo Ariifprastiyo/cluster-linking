@@ -191,3 +191,11 @@ Test connectivity from a destination node:
 openssl s_client -connect node-all-service.alldataint.com:9093 \
   -CAfile /var/ssl/private/kafka_broker_source.truststore.jks 2>&1 | head -20
 ```
+
+## Untuk disaster di source  cluster (cluster mati mendadak)  jalankan 
+```
+kafka-mirrors --failover \
+   --topic-filters-json-file topic-filters.json \
+  --bootstrap-server node-all-service.alldataint.com:9093 \
+  --command-config destination.properties
+```
