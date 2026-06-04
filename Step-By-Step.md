@@ -6,27 +6,6 @@
 
 ---
 
-## Arsitektur Overview
-
-```
-[MySQL Source DB]          [MySQL Target DB]
-  10.100.13.154              10.100.13.153
-       │                           ▲
-       ▼                           │
-[Debezium Source]          [JDBC Sink Connector]
- node1/2/3:8083             node-all-service:8083
-       │                           │
-       ▼                           │
-[Kafka node1/2/3]          [Kafka node-all-service]
- SOURCE CLUSTER    ──────▶  DESTINATION CLUSTER
-  OAUTHBEARER               PLAIN (broker)
-                             OAUTHBEARER (connect)
-       │                           │
-[Schema Registry]  ──────▶ [Schema Registry]
- node1/2/3:8081    Schema    node-all-service:8081
-                   Linking
-                  (schema-exporter)
-```
 
 ### Info Cluster
 
@@ -36,7 +15,7 @@
 | Schema Registry | node1/2/3.alldataint.com:8081 | node-all-service.alldataint.com:8081 |
 | Kafka Connect | node1.alldataint.com:8083 | node-all-service.alldataint.com:8083 |
 | MDS | node1/2/3.alldataint.com:8090 | node-all-service.alldataint.com:8090 |
-| Broker SASL | OAUTHBEARER | PLAIN |
+| Broker SASL | OAUTHBEARER | OAUTHBEARER |
 | Connect Worker SASL | OAUTHBEARER | OAUTHBEARER |
 
 ### Topic yang Di-link
