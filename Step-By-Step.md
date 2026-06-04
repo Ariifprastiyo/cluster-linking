@@ -22,9 +22,10 @@
   OAUTHBEARER               PLAIN (broker)
                              OAUTHBEARER (connect)
        │                           │
-[Schema Registry]          [Schema Registry]
- node1/2/3:8081      ──▶   node-all-service:8081
-                     Schema Linking
+[Schema Registry]  ──────▶ [Schema Registry]
+ node1/2/3:8081    Schema    node-all-service:8081
+                   Linking
+                  (schema-exporter)
 ```
 
 ### Info Cluster
@@ -36,7 +37,7 @@
 | Kafka Connect | node1.alldataint.com:8083 | node-all-service.alldataint.com:8083 |
 | MDS | node1/2/3.alldataint.com:8090 | node-all-service.alldataint.com:8090 |
 | Broker SASL | OAUTHBEARER | PLAIN |
-| Connect SASL | OAUTHBEARER | OAUTHBEARER |
+| Connect Worker SASL | OAUTHBEARER | OAUTHBEARER |
 
 ### Topic yang Di-link
 
@@ -60,23 +61,9 @@ scp root@node1.alldataint.com:/var/ssl/private/kafka_broker.truststore.jks \
 chown cp-kafka:cp-kafka /var/ssl/private/kafka_broker_source.truststore.jks
 ```
 
-### 2. Tingkatkan Timeout Schema Registry
+### 2. Buat File Konfigurasi
 
-Tambahkan ke `/etc/schema-registry/schema-registry.properties`:
-
-```bash
-cat >> /etc/schema-registry/schema-registry.properties << 'EOF'
-kafkastore.timeout.ms=10000
-kafkastore.write.max.retries=5
-EOF
-
-systemctl restart confluent-schema-registry
-sleep 15
-```
-
-### 3. Buat File Config
-
-**`destination.properties`** (admin ke node-all-service):
+**`destination.properties`** — digunakan untuk semua perintah CLI dan sebagai admin config ke node-all-service:
 ```properties
 bootstrap.servers=node-all-service.alldataint.com:9093
 security.protocol=SASL_SSL
@@ -86,7 +73,7 @@ ssl.truststore.location=/var/ssl/private/kafka_broker.truststore.jks
 ssl.truststore.password=confluenttruststorepass
 ```
 
-**`source.properties`** (koneksi ke source + schema linking):
+**`source.properties`** — koneksi dari destination ke source cluster:
 ```properties
 bootstrap.servers=node1.alldataint.com:9093,node2.alldataint.com:9093,node3.alldataint.com:9093
 link.mode=DESTINATION
@@ -99,16 +86,7 @@ ssl.truststore.password=confluenttruststorepass
 mirror.start.offset.spec=earliest
 consumer.offset.sync.enable=true
 consumer.offset.sync.ms=5000
-
-# Schema Linking — otomatis sync schema dari source ke destination SR
-schema.registry.url=https://node1.alldataint.com:8081,https://node2.alldataint.com:8081
-schema.registry.ssl.truststore.location=/var/ssl/private/kafka_connect.truststore.jks
-schema.registry.ssl.truststore.password=confluenttruststorepass
-schema.registry.basic.auth.credentials.source=USER_INFO
-schema.registry.basic.auth.user.info=admin:P@ssw0rd
 ```
-
-> ⚠️ Dengan menambahkan `schema.registry.*` di `source.properties`, schema dari source SR akan **otomatis di-sync** ke destination SR saat cluster link dibuat — tidak perlu manual import schema satu per satu.
 
 **`topic-filters.json`**:
 ```json
@@ -135,20 +113,7 @@ schema.registry.basic.auth.user.info=admin:P@ssw0rd
 
 ## Langkah 1 — Buat Cluster Link
 
-### 1.1 Buat admin.properties untuk CLI tools
-
-```bash
-cat > /tmp/admin.properties << 'EOF'
-bootstrap.servers=node-all-service.alldataint.com:9093
-security.protocol=SASL_SSL
-sasl.mechanism=PLAIN
-sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="admin" password="P@ssw0rd";
-ssl.truststore.location=/var/ssl/private/kafka_broker.truststore.jks
-ssl.truststore.password=confluenttruststorepass
-EOF
-```
-
-### 1.2 Buat Cluster Link
+### 1.1 Buat Cluster Link di node-all-service
 
 ```bash
 kafka-cluster-links --create \
@@ -160,7 +125,7 @@ kafka-cluster-links --create \
   --consumer-group-filters-json-file group-filters.json
 ```
 
-### 1.3 Verifikasi Link ACTIVE
+### 1.2 Verifikasi Link ACTIVE
 
 ```bash
 kafka-cluster-links --list \
@@ -170,33 +135,87 @@ kafka-cluster-links --list \
 
 > ✅ Pastikan status = `ACTIVE`
 
-### 1.4 Verifikasi Mirror Topic Terbentuk
+### 1.3 Verifikasi Mirror Topic Terbentuk
 
 ```bash
 kafka-topics --bootstrap-server node-all-service.alldataint.com:9093 \
-  --command-config /tmp/admin.properties \
+  --command-config destination.properties \
   --list | grep db_ecommerce
 ```
 
-### 1.5 Verifikasi Schema Sudah Ter-sync (Schema Linking)
+### 1.4 Verifikasi Offset Consumer Group Ter-sync
+
+```bash
+kafka-consumer-groups \
+  --bootstrap-server node-all-service.alldataint.com:9093 \
+  --command-config destination.properties \
+  --group connect-JdbcSinkConnector-orders-arif \
+  --describe
+```
+
+> ⚠️ Tunggu kolom `LAG = 0` sebelum melakukan failover.
+
+---
+
+## Langkah 2 — Setup Schema Linking
+
+Schema Linking adalah fitur Confluent Platform yang men-sync schema dari source Schema Registry ke destination secara otomatis dan continuous. Dikonfigurasi via `schema-exporter` — **terpisah dari cluster link**.
+
+### 2.1 Buat Config Source Schema Registry
+
+```bash
+cat > /tmp/schema-link-source.properties << 'EOF'
+schema.registry.url=https://node1.alldataint.com:8081,https://node2.alldataint.com:8081
+basic.auth.credentials.source=USER_INFO
+basic.auth.user.info=admin:P@ssw0rd
+schema.registry.ssl.truststore.location=/var/ssl/private/kafka_connect.truststore.jks
+schema.registry.ssl.truststore.password=confluenttruststorepass
+EOF
+```
+
+### 2.2 Buat Schema Exporter
+
+```bash
+schema-exporter --create \
+  --name schema-link-ecommerce \
+  --config-file /tmp/schema-link-source.properties \
+  --schema-registry-url https://node-all-service.alldataint.com:8081 \
+  --basic-auth-credentials-source USER_INFO \
+  --basic-auth-user-info admin:P@ssw0rd \
+  --schema-registry-ssl.truststore.location /var/ssl/private/kafka_connect.truststore.jks \
+  --schema-registry-ssl.truststore.password confluenttruststorepass \
+  --subject-format ":.*:" \
+  --context-type NONE
+```
+
+### 2.3 Verifikasi Exporter Running
+
+```bash
+schema-exporter --list \
+  --schema-registry-url https://node-all-service.alldataint.com:8081 \
+  --basic-auth-credentials-source USER_INFO \
+  --basic-auth-user-info admin:P@ssw0rd
+```
+
+### 2.4 Verifikasi Schema Sudah Ter-sync
 
 ```bash
 curl -sk https://node-all-service.alldataint.com:8081/subjects \
   -u admin:P@ssw0rd
 ```
 
-> ✅ Harusnya sudah ada `db_ecommerce.db_ecommerce.orders-key` dan `db_ecommerce.db_ecommerce.orders-value` secara otomatis.
+> ✅ Harus sudah ada `db_ecommerce.db_ecommerce.orders-key` dan `db_ecommerce.db_ecommerce.orders-value` secara otomatis.
 
 ---
 
-## Langkah 2 — Setup Connector di node-all-service
+## Langkah 3 — Setup Connector di node-all-service
 
-### 2.1 Debezium MySQL Source Connector
+### 3.1 Debezium MySQL Source Connector
 
 > ⚠️ **Perbedaan penting dari config di node1/2/3:**
-> - `database.server.id` → **HARUS BERBEDA** (gunakan `26052027` bukan `26052026`)
+> - `database.server.id` → **HARUS BERBEDA** (gunakan `26052027`, bukan `26052026`) untuk menghindari konflik MySQL replica
 > - `database.history.kafka.bootstrap.servers` → ganti ke `node-all-service`
-> - `database.history.consumer/producer sasl` → ganti ke **PLAIN**
+> - `database.history.consumer/producer sasl` → ganti ke **PLAIN** (sesuai broker node-all-service)
 > - `schema.registry.url` → ganti ke `node-all-service:8081`
 
 Buat file `MySqlConnector-node-all-service.json`:
@@ -265,10 +284,10 @@ curl -sk -X POST https://node-all-service.alldataint.com:8083/connectors \
   -d @MySqlConnector-node-all-service.json
 ```
 
-### 2.2 JDBC Sink Connector
+### 3.2 JDBC Sink Connector
 
 > ⚠️ **Perbedaan penting dari config di node1/2/3:**
-> - `consumer.override.sasl.mechanism` → **OAUTHBEARER** (worker Connect di node-all-service pakai OAUTHBEARER)
+> - `consumer.override.sasl.mechanism` → **OAUTHBEARER** (worker Kafka Connect di node-all-service pakai OAUTHBEARER)
 > - `consumer.override.sasl.jaas.config` → metadataServerUrls ke `node-all-service:8090`
 > - Tambah `consumer.override.sasl.login.callback.handler.class`
 > - `schema.registry.url` → ganti ke `node-all-service:8081`
@@ -337,7 +356,7 @@ curl -sk -X POST https://node-all-service.alldataint.com:8083/connectors \
   -d @JdbcSinkConnector-node-all-service.json
 ```
 
-### 2.3 Verifikasi Kedua Connector RUNNING
+### 3.3 Verifikasi Kedua Connector RUNNING
 
 ```bash
 # Cek Debezium Source
@@ -349,15 +368,17 @@ curl -sk https://node-all-service.alldataint.com:8083/connectors/JdbcSinkConnect
   -u admin:P@ssw0rd | python3 -m json.tool
 ```
 
-> ✅ State connector dan task harus `RUNNING`
+> ✅ State connector dan semua task harus `RUNNING`
+
+> ⚠️ Jika task FAILED, cek log: `tail -50 /data/log/kafka-connect/connect.log`
 
 ---
 
-## Langkah 3 — Failover (Skenario DR)
+## Langkah 4 — Failover (Skenario DR)
 
 > ⚠️ Lakukan langkah ini ketika source cluster (node1/2/3) akan dimatikan atau terjadi disaster.
 
-### 3.1 Pause Debezium di Source Cluster
+### 4.1 Pause Debezium di Source Cluster
 
 Harus dilakukan **sebelum failover** untuk menghindari konflik `server_id`:
 
@@ -370,46 +391,46 @@ curl -sk https://node1.alldataint.com:8083/connectors/MySqlConnectorConnector_1-
   -u admin:P@ssw0rd | python3 -m json.tool
 ```
 
-### 3.2 Tunggu Consumer Group LAG = 0
+### 4.2 Tunggu Consumer Group LAG = 0
 
 ```bash
 kafka-consumer-groups \
   --bootstrap-server node-all-service.alldataint.com:9093 \
-  --command-config /tmp/admin.properties \
+  --command-config destination.properties \
   --group connect-JdbcSinkConnector-orders-arif \
   --describe
 ```
 
 > ⚠️ Lanjutkan **hanya jika** kolom `LAG = 0`
 
-### 3.3 Promote Mirror Topics (Failover)
+### 4.3 Promote Mirror Topics (Failover)
 
 ```bash
 kafka-mirrors --failover \
   --topics db_ecommerce,db_ecommerce.db_ecommerce.orders,db_ecommerce.history-arif,db_ecommerce.orders \
   --bootstrap-server node-all-service.alldataint.com:9093 \
-  --command-config /tmp/admin.properties
+  --command-config destination.properties
 ```
 
-### 3.4 Verifikasi Topic Sudah Writable
+### 4.4 Verifikasi Topic Sudah Writable
 
 ```bash
-# Output harus kosong (No mirror topics found)
+# Output harus kosong — "No mirror topics found"
 kafka-mirrors --describe \
   --bootstrap-server node-all-service.alldataint.com:9093 \
-  --command-config /tmp/admin.properties
+  --command-config destination.properties
 
 # Describe topic untuk konfirmasi tidak ada flag mirrorTopic
 kafka-topics --bootstrap-server node-all-service.alldataint.com:9093 \
-  --command-config /tmp/admin.properties \
+  --command-config destination.properties \
   --describe --topic db_ecommerce.db_ecommerce.orders
 ```
 
 ---
 
-## Langkah 4 — Aktivasi Pipeline di Destination
+## Langkah 5 — Aktivasi Pipeline di Destination
 
-### 4.1 Restart Debezium di node-all-service
+### 5.1 Restart Debezium di node-all-service
 
 ```bash
 # Restart task
@@ -417,11 +438,7 @@ curl -sk -X POST \
   https://node-all-service.alldataint.com:8083/connectors/MySqlConnectorConnector_1-arif/tasks/0/restart \
   -u admin:P@ssw0rd
 
-# Atau restart full connector jika task masih FAILED
-curl -sk -X POST \
-  'https://node-all-service.alldataint.com:8083/connectors/MySqlConnectorConnector_1-arif/restart?includeTasks=true&onlyFailed=true' \
-  -u admin:P@ssw0rd
-
+# Tunggu startup
 sleep 10
 
 # Verifikasi RUNNING
@@ -429,7 +446,14 @@ curl -sk https://node-all-service.alldataint.com:8083/connectors/MySqlConnectorC
   -u admin:P@ssw0rd | python3 -m json.tool
 ```
 
-### 4.2 Test Inject Data ke MySQL Source
+> Jika task masih FAILED:
+> ```bash
+> curl -sk -X POST \
+>   'https://node-all-service.alldataint.com:8083/connectors/MySqlConnectorConnector_1-arif/restart?includeTasks=true&onlyFailed=true' \
+>   -u admin:P@ssw0rd
+> ```
+
+### 5.2 Test Inject Data ke MySQL Source
 
 ```bash
 mysql -h 10.100.13.154 -u debezium -p'P@ssw0rd' \
@@ -437,117 +461,35 @@ mysql -h 10.100.13.154 -u debezium -p'P@ssw0rd' \
       VALUES (99, 'test-failover', 999.99, 'pending', NOW(), NOW());"
 ```
 
-### 4.3 Verifikasi Offset Topic Naik
+### 5.3 Verifikasi Offset Topic Naik
 
 ```bash
 kafka-get-offsets \
   --bootstrap-server node-all-service.alldataint.com:9093 \
-  --command-config /tmp/admin.properties \
+  --command-config destination.properties \
   --topic db_ecommerce.db_ecommerce.orders
 ```
 
 > ✅ Angka offset harus bertambah setelah inject data
 
-### 4.4 Verifikasi JDBC Sink LAG = 0
+### 5.4 Verifikasi JDBC Sink LAG = 0
 
 ```bash
 kafka-consumer-groups \
   --bootstrap-server node-all-service.alldataint.com:9093 \
-  --command-config /tmp/admin.properties \
+  --command-config destination.properties \
   --group connect-JdbcSinkConnector-orders-arif \
   --describe
 ```
 
-### 4.5 Verifikasi Data di MySQL Target
+### 5.5 Verifikasi Data di MySQL Target
 
 ```bash
 mysql -h 10.100.13.153 -u kafka_sink -p'P@ssw0rd' \
   -e "SELECT COUNT(*) FROM db_ecommerce.orders;"
 ```
 
----
-
-## Schema Linking (Cara yang Benar)
-
-Schema Linking memungkinkan schema Registry di destination **otomatis sync** dari source tanpa perlu manual import.
-
-### Setup Schema Linking via Cluster Link
-
-Cara paling mudah adalah menyertakan config schema registry di `source.properties` **sebelum** membuat cluster link:
-
-```properties
-# Tambahkan ini ke source.properties
-schema.registry.url=https://node1.alldataint.com:8081,https://node2.alldataint.com:8081
-schema.registry.ssl.truststore.location=/var/ssl/private/kafka_connect.truststore.jks
-schema.registry.ssl.truststore.password=confluenttruststorepass
-schema.registry.basic.auth.credentials.source=USER_INFO
-schema.registry.basic.auth.user.info=admin:P@ssw0rd
-```
-
-### Setup Schema Linking via schema-exporter (Alternatif)
-
-Jika cluster link sudah terlanjur dibuat tanpa schema linking, gunakan `schema-exporter`:
-
-```bash
-# Buat config source SR
-cat > /tmp/schema-link-source.properties << 'EOF'
-schema.registry.url=https://node1.alldataint.com:8081,https://node2.alldataint.com:8081
-basic.auth.credentials.source=USER_INFO
-basic.auth.user.info=admin:P@ssw0rd
-schema.registry.ssl.truststore.location=/var/ssl/private/kafka_connect.truststore.jks
-schema.registry.ssl.truststore.password=confluenttruststorepass
-EOF
-
-# Buat schema exporter
-schema-exporter --create \
-  --name schema-link-migration \
-  --config-file /tmp/schema-link-source.properties \
-  --schema-registry-url https://node-all-service.alldataint.com:8081 \
-  --basic-auth-credentials-source USER_INFO \
-  --basic-auth-user-info admin:P@ssw0rd \
-  --schema-registry-ssl.truststore.location /var/ssl/private/kafka_connect.truststore.jks \
-  --schema-registry-ssl.truststore.password confluenttruststorepass \
-  --subject-format ":.*:" \
-  --context-type NONE
-
-# Verifikasi exporter running
-schema-exporter --list \
-  --schema-registry-url https://node-all-service.alldataint.com:8081 \
-  --basic-auth-credentials-source USER_INFO \
-  --basic-auth-user-info admin:P@ssw0rd
-
-# Cek schema sudah masuk
-curl -sk https://node-all-service.alldataint.com:8081/subjects \
-  -u admin:P@ssw0rd
-```
-
-### Manual Import Schema (Fallback)
-
-Jika schema linking tidak tersedia, import manual:
-
-```bash
-# 1. Ambil schema dari source
-KEY_SCHEMA=$(curl -sk \
-  https://node1.alldataint.com:8081/subjects/db_ecommerce.db_ecommerce.orders-key/versions/latest \
-  -u admin:P@ssw0rd | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['schema'])")
-
-VALUE_SCHEMA=$(curl -sk \
-  https://node1.alldataint.com:8081/subjects/db_ecommerce.db_ecommerce.orders-value/versions/latest \
-  -u admin:P@ssw0rd | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['schema'])")
-
-# 2. Register ke destination
-curl -sk -X POST \
-  https://node-all-service.alldataint.com:8081/subjects/db_ecommerce.db_ecommerce.orders-key/versions \
-  -u admin:P@ssw0rd \
-  -H "Content-Type: application/json" \
-  -d "{\"schema\": $(echo $KEY_SCHEMA | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')}"
-
-curl -sk -X POST \
-  https://node-all-service.alldataint.com:8081/subjects/db_ecommerce.db_ecommerce.orders-value/versions \
-  -u admin:P@ssw0rd \
-  -H "Content-Type: application/json" \
-  -d "{\"schema\": $(echo $VALUE_SCHEMA | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')}"
-```
+> ✅ Pipeline CDC lengkap sudah berjalan: **MySQL Source → Debezium → Kafka → JDBC Sink → MySQL Target**
 
 ---
 
@@ -557,12 +499,11 @@ curl -sk -X POST \
 |---|---|---|
 | `A replica with same server_id has connected` | `database.server.id` konflik dengan Debezium di source | Pause Debezium di source ATAU ganti `server.id` ke angka berbeda |
 | `Unexpected SASL mechanism: PLAIN` | Worker Connect pakai OAUTHBEARER tapi `consumer.override` pakai PLAIN | Ganti `consumer.override.sasl.mechanism` ke OAUTHBEARER |
-| `Register operation timed out (50002)` | `kafkastore.timeout.ms` terlalu kecil (default 500ms) | Tambah `kafkastore.timeout.ms=10000` di SR properties lalu restart |
-| `Connection refused` ke Schema Registry | SR baru di-restart, belum fully up | Restart task: `POST /connectors/{name}/tasks/0/restart` |
-| `NoSuchFileException` (truststore) | File truststore belum ada di node destination | Copy truststore dari source ke destination |
+| `Connection refused` ke Schema Registry | Connector restart saat SR belum fully up | Restart task: `POST /connectors/{name}/tasks/0/restart` |
+| `NoSuchFileException` truststore | File truststore belum ada di node destination | Copy truststore dari source ke destination |
 | Topic masih read-only setelah failover | `kafka-mirrors --failover` belum dijalankan | Jalankan `kafka-mirrors --failover` untuk semua topic |
 | Data tidak masuk ke topic setelah inject | Debezium di source masih jalan, konflik `server_id` | Pause Debezium di source, restart connector di destination |
-| SR subjects kosong `[]` setelah link dibuat | Schema linking tidak dikonfigurasi di `source.properties` | Tambahkan `schema.registry.*` config atau gunakan `schema-exporter` |
+| SR subjects kosong setelah link dibuat | Schema exporter belum dibuat | Jalankan `schema-exporter --create` (Langkah 2) |
 
 ---
 
@@ -570,9 +511,8 @@ curl -sk -X POST \
 
 ### Pre-Failover
 - [ ] Truststore source sudah di-copy ke node-all-service
-- [ ] `kafkastore.timeout.ms=10000` sudah ditambahkan ke SR config
 - [ ] Cluster link sudah `ACTIVE`
-- [ ] Schema sudah ter-sync di node-all-service SR (via Schema Linking)
+- [ ] Schema exporter sudah running dan schema sudah ter-sync di destination SR
 - [ ] Kedua connector (Source + Sink) sudah `RUNNING` di node-all-service
 - [ ] Consumer group `LAG = 0`
 
@@ -583,7 +523,7 @@ curl -sk -X POST \
 - [ ] Verifikasi `kafka-mirrors --describe` output kosong
 
 ### Post-Failover
-- [ ] Restart Debezium connector di node-all-service
+- [ ] Restart Debezium task di node-all-service
 - [ ] Inject test data ke MySQL source
 - [ ] Verifikasi offset topic naik
 - [ ] Verifikasi LAG JDBC Sink `= 0`
