@@ -456,9 +456,7 @@ curl -sk https://node-all-service.alldataint.com:8083/connectors/MySqlConnectorC
 ### 5.2 Test Inject Data ke MySQL Source
 
 ```bash
-mysql -h 10.100.13.154 -u debezium -p'P@ssw0rd' \
-  -e "INSERT INTO db_ecommerce.orders (customer_id, product, total, status, created_at, updated_at)
-      VALUES (99, 'test-failover', 999.99, 'pending', NOW(), NOW());"
+ python3 inject_data_db_ecommerce.py
 ```
 
 ### 5.3 Verifikasi Offset Topic Naik
