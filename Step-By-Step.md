@@ -194,7 +194,6 @@ curl -sk https://node-all-service.alldataint.com:8081/subjects \
 > ⚠️ **Perbedaan penting dari config di node1/2/3:**
 > - `database.server.id` → **HARUS BERBEDA** (gunakan `26052027`, bukan `26052026`) untuk menghindari konflik MySQL replica
 > - `database.history.kafka.bootstrap.servers` → ganti ke `node-all-service`
-> - `database.history.consumer/producer sasl` → ganti ke **PLAIN** (sesuai broker node-all-service)
 > - `schema.registry.url` → ganti ke `node-all-service:8081`
 
 Buat file `MySqlConnector-node-all-service.json`:
