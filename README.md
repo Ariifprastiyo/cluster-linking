@@ -192,7 +192,11 @@ openssl s_client -connect node-all-service.alldataint.com:9093 \
   -CAfile /var/ssl/private/kafka_broker_source.truststore.jks 2>&1 | head -20
 ```
 
-## Untuk disaster di source  cluster (cluster mati mendadak)  jalankan 
+# Schema Lingking
+
+Setelah cluster lingking berhasil maka lakukan schema lingking agar bisa produce 
+
+## Stelah itu jalankan command ini Untuk disaster di source  cluster (cluster mati mendadak)  jalankan 
 ```
 kafka-mirrors --failover \
    --topic-filters-json-file topic-filters.json \
