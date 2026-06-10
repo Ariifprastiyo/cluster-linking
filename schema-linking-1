@@ -1,8 +1,8 @@
-# Schema Linking — Step by Step (On-Prem to On-Prem)
+   # Schema Linking — Step by Step (On-Prem to On-Prem)
 
-**Source SR:** node1/2/3.alldataint.com:8081 (DEV)  
-**Destination SR:** node-all-service.alldataint.com:8081 (UAT)  
-**Dijalankan dari:** node1 (source side)
+Source SR: node1/2/3.alldataint.com:8081 (DEV)  
+Destination SR: node-all-service.alldataint.com:8081 (UAT)  
+Dijalankan dari: node1 (source side)
 
 ---
 
